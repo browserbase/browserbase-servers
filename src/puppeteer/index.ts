@@ -12,10 +12,78 @@ import {
   ImageContent,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import puppeteer, { Browser, Page } from "puppeteer";
+import puppeteer, { Browser, Page } from "puppeteer-core";
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+import { Client } from "@notionhq/client";
 
-// Define the tools once to avoid repetition
+// 1. Configuration & Environment Setup
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
+
+// Environment variables configuration
+const requiredEnvVars = {
+  NOTION_API_KEY: process.env.NOTION_API_KEY,
+  BROWSERBASE_API_KEY: process.env.BROWSERBASE_API_KEY,
+  BROWSERBASE_PROJECT_ID: process.env.BROWSERBASE_PROJECT_ID
+};
+
+// Validate required environment variables
+Object.entries(requiredEnvVars).forEach(([name, value]) => {
+  if (!value) throw new Error(`${name} environment variable is required`);
+});
+
+// Optional environment variables
+const NOTION_PAGE_URL = process.env.NOTION_PAGE_URL || "https://www.notion.so/default-page";
+const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID || "default-database-id";
+
+// 2. Global State
+const browsers = new Map<string, { browser: Browser, page: Page }>();
+const consoleLogs: string[] = [];
+const screenshots = new Map<string, string>();
+const notion = new Client({ auth: process.env.NOTION_API_KEY });
+
+// 3. Helper Functions
+function extractNotionPageId(url: string): string {
+  const match = url.match(/[a-zA-Z0-9]{8}-?[a-zA-Z0-9]{4}-?[a-zA-Z0-9]{4}-?[a-zA-Z0-9]{4}-?[a-zA-Z0-9]{12}/);
+  if (!match) throw new Error("Could not extract page ID from Notion URL");
+  return match[0].replace(/-/g, '');
+}
+
+async function createNewBrowserSession(sessionId: string) {
+  const browser = await puppeteer.connect({
+    browserWSEndpoint: `wss://connect.browserbase.com?apiKey=${process.env.BROWSERBASE_API_KEY}`
+  });
+  
+  const page = (await browser.pages())[0];
+  browsers.set(sessionId, { browser, page });
+  
+  // Set up console logging for this session
+  page.on("console", (msg) => {
+    const logEntry = `[Session ${sessionId}][${msg.type()}] ${msg.text()}`;
+    consoleLogs.push(logEntry);
+    server.notification({
+      method: "notifications/cloud/message",
+      params: { message: logEntry, type: "console_log" },
+    });
+  });
+  
+  return { browser, page };
+}
+
+// 4. Tool Definitions
 const TOOLS: Tool[] = [
+  {
+    name: "puppeteer_create_session",
+    description: "Create a new cloud browser session using Browserbase",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
   {
     name: "puppeteer_navigate",
     description: "Navigate to a URL",
@@ -75,38 +143,163 @@ const TOOLS: Tool[] = [
       required: ["script"],
     },
   },
+  {
+    name: "puppeteer_get_content",
+    description: "Extract all content from the current page",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selector: { 
+          type: "string", 
+          description: "Optional CSS selector to get content from specific elements (default: returns whole page)",
+          required: false 
+        }
+      },
+      required: [], // Removed sessionId requirement since it's not needed
+    },
+  },
+  {
+    name: "puppeteer_parallel_sessions",
+    description: "Create multiple browser sessions and navigate to different URLs",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessions: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+              id: { type: "string" }
+            },
+            required: ["url", "id"]
+          }
+        }
+      },
+      required: ["sessions"]
+    }
+  },
+  {
+    name: "notion_read_page",
+    description: "Read content from a Notion page",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pageUrl: { type: "string", description: "URL of the page to read" },
+      },
+      required: [], // Make optional since we'll use default URL if not provided
+    },
+  },
+  {
+    name: "notion_update_page",
+    description: "Update content in a Notion page",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pageId: { type: "string", description: "ID of the page to update" },
+        content: { type: "string", description: "Content to update" },
+      },
+      required: ["pageId", "content"],
+    },
+  },
+  {
+    name: "notion_append_content",
+    description: "Append content to a Notion page",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pageId: { type: "string", description: "ID of the page to append to" },
+        content: { type: "string", description: "Content to append" },
+      },
+      required: ["pageId", "content"],
+    },
+  },
+  {
+    name: "notion_read_comments",
+    description: "Read comments from a Notion page",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pageId: { type: "string", description: "ID of the page to read comments from" },
+      },
+      required: ["pageId"],
+    },
+  },
+  {
+    name: "notion_add_comment",
+    description: "Add a comment to a Notion page",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pageId: { type: "string", description: "ID of the page to comment on" },
+        comment: { type: "string", description: "Comment text" },
+      },
+      required: ["pageId", "comment"],
+    },
+  },
+  {
+    name: "notion_add_to_database",
+    description: "Add a new entry to a Notion database",
+    inputSchema: {
+      type: "object",
+      properties: {
+        databaseId: { 
+          type: "string", 
+          description: "ID of the database (optional - will use default if not provided)" 
+        },
+        title: { type: "string", description: "Title of the entry" },
+        tags: { 
+          type: "array", 
+          description: "Array of tags to add to the entry",
+          items: { type: "string" }
+        },
+        properties: { 
+          type: "object", 
+          description: "Additional properties for the database entry (optional)",
+          additionalProperties: true 
+        },
+        content: { type: "string", description: "Content for the page (optional)" }
+      },
+      required: ["title"],
+    },
+  },
 ];
 
-// Global state
-let browser: Browser | undefined;
-let page: Page | undefined;
-const consoleLogs: string[] = [];
-const screenshots = new Map<string, string>();
-
-async function ensureBrowser() {
-  if (!browser) {
-    browser = await puppeteer.launch({ headless: false });
-    const pages = await browser.pages();
-    page = pages[0];
-    
-    page.on("console", (msg) => {
-      const logEntry = `[${msg.type()}] ${msg.text()}`;
-      consoleLogs.push(logEntry);
-      server.notification({
-        method: "notifications/resources/updated",
-        params: { uri: "console://logs" },
-      });
-    });
-  }
-  return page!;
-}
-
+// 5. Tool Handler Implementation
 async function handleToolCall(name: string, args: any): Promise<{ toolResult: CallToolResult }> {
-  const page = await ensureBrowser();
-
+// const { browser, page } = browsers.get(args.sessionId) || await createNewBrowserSession(args.sessionId);
+    
+  // Only create default session if it's not a parallel_sessions call
+  const defaultSession = name !== "puppeteer_parallel_sessions" ? 
+    (browsers.get(args.sessionId) || await createNewBrowserSession(args.sessionId)) : 
+    null;
+  
   switch (name) {
+    case "puppeteer_create_session":
+      try {
+        await createNewBrowserSession(args.sessionId);
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: "Created new browser session",
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to create browser session: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
     case "puppeteer_navigate":
-      await page.goto(args.url);
+      await defaultSession!.page.goto(args.url);
       return {
         toolResult: {
           content: [{
@@ -120,11 +313,11 @@ async function handleToolCall(name: string, args: any): Promise<{ toolResult: Ca
     case "puppeteer_screenshot": {
       const width = args.width ?? 800;
       const height = args.height ?? 600;
-      await page.setViewport({ width, height });
+      await defaultSession!.page.setViewport({ width, height });
 
       const screenshot = await (args.selector ? 
-        (await page.$(args.selector))?.screenshot({ encoding: "base64" }) :
-        page.screenshot({ encoding: "base64", fullPage: false }));
+        (await defaultSession!.page.$(args.selector))?.screenshot({ encoding: "base64" }) :
+        defaultSession!.page.screenshot({ encoding: "base64", fullPage: false }));
 
       if (!screenshot) {
         return {
@@ -163,7 +356,7 @@ async function handleToolCall(name: string, args: any): Promise<{ toolResult: Ca
 
     case "puppeteer_click":
       try {
-        await page.click(args.selector);
+        await defaultSession!.page.click(args.selector);
         return {
           toolResult: {
             content: [{
@@ -187,8 +380,8 @@ async function handleToolCall(name: string, args: any): Promise<{ toolResult: Ca
 
     case "puppeteer_fill":
       try {
-        await page.waitForSelector(args.selector);
-        await page.type(args.selector, args.value);
+        await defaultSession!.page.waitForSelector(args.selector);
+        await defaultSession!.page.type(args.selector, args.value);
         return {
           toolResult: {
             content: [{
@@ -212,7 +405,7 @@ async function handleToolCall(name: string, args: any): Promise<{ toolResult: Ca
 
     case "puppeteer_evaluate":
       try {
-        const result = await page.evaluate((script) => {
+        const result = await defaultSession!.page.evaluate((script) => {
           const logs: string[] = [];
           const originalConsole = { ...console };
           
@@ -256,6 +449,424 @@ async function handleToolCall(name: string, args: any): Promise<{ toolResult: Ca
         };
       }
 
+    case "puppeteer_get_json":
+      try {
+        const result = await defaultSession!.page.evaluate((selector) => {
+          // Helper function to find JSON in text
+          function extractJSON(text: string) {
+            const jsonObjects = [];
+            let braceCount = 0;
+            let start = -1;
+            
+            for (let i = 0; i < text.length; i++) {
+              if (text[i] === '{') {
+                if (braceCount === 0) start = i;
+                braceCount++;
+              } else if (text[i] === '}') {
+                braceCount--;
+                if (braceCount === 0 && start !== -1) {
+                  try {
+                    const jsonStr = text.slice(start, i + 1);
+                    const parsed = JSON.parse(jsonStr);
+                    jsonObjects.push(parsed);
+                  } catch (e) {
+                    // Invalid JSON, continue searching
+                  }
+                }
+              }
+            }
+            return jsonObjects;
+          }
+
+          // Get all text content based on selector or full page
+          const elements = selector ? 
+            Array.from(document.querySelectorAll(selector)) : 
+            [document.body];
+          
+          const results = {
+            // Look for JSON in text content
+            textContent: elements.flatMap(el => extractJSON(el.textContent || '')),
+            
+            // Look for JSON in script tags
+            scriptTags: Array.from(document.getElementsByTagName('script'))
+              .flatMap(script => {
+                try {
+                  if (script.type === 'application/json') {
+                    return [JSON.parse(script.textContent || '')];
+                  }
+                  return extractJSON(script.textContent || '');
+                } catch (e) {
+                  return [];
+                }
+              }),
+            
+            // Look for JSON in meta tags
+            metaTags: Array.from(document.getElementsByTagName('meta'))
+              .flatMap(meta => {
+                try {
+                  const content = meta.getAttribute('content') || '';
+                  return extractJSON(content);
+                } catch (e) {
+                  return [];
+                }
+              }),
+            
+            // Look for JSON-LD
+            jsonLd: Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+              .flatMap(script => {
+                try {
+                  return [JSON.parse(script.textContent || '')];
+                } catch (e) {
+                  return [];
+                }
+              })
+          };
+
+          return results;
+        }, args.selector);
+
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Found JSON content:\n${JSON.stringify(result, null, 2)}`,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to extract JSON: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "puppeteer_get_content":
+      try {
+        let content;
+        if (args.selector) {
+          // If selector is provided, get content from specific elements
+          content = await defaultSession!.page.evaluate((selector) => {
+            const elements = document.querySelectorAll(selector);
+            return Array.from(elements).map(el => el.textContent || '');
+          }, args.selector);
+        } else {
+          // If no selector is provided, get content from the whole page
+          content = await defaultSession!.page.evaluate(() => {
+            return Array.from(document.querySelectorAll('*')).map(el => el.textContent || '');
+          });
+        }
+
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Extracted content:\n${JSON.stringify(content, null, 2)}`,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to extract content: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "puppeteer_parallel_sessions":
+      try {
+        console.log(`Starting parallel sessions for ${args.sessions.length} sessions`);
+        const results = await Promise.all(args.sessions.map(async (session: { url: string, id: string }) => {
+          console.log(`Creating session for ${session.id}: ${session.url}`);
+          const { page } = await createNewBrowserSession(session.id);
+          try {
+            await page.goto(session.url);
+            const content = await page.evaluate(() => document.body.innerText);
+            return {
+              id: session.id,
+              url: session.url,
+              content: content
+            };
+          } catch (error) {
+            return {
+              id: session.id,
+              url: session.url,
+              error: (error as Error).message
+            };
+          }
+        }));
+
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Parallel sessions results:\n${JSON.stringify(results, null, 2)}`,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to execute parallel sessions: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "notion_read_page":
+      try {
+        const pageUrl = args.pageUrl || NOTION_PAGE_URL;
+        const pageId = extractNotionPageId(pageUrl);
+        const pageContent = await notion.blocks.children.list({
+          block_id: pageId,
+        });
+        
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: JSON.stringify(pageContent, null, 2),
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to read page: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "notion_update_page":
+      try {
+        // Convert content string to blocks array
+        const blocks = [{
+          object: 'block' as const,
+          type: 'paragraph' as const,
+          paragraph: {
+            rich_text: [{
+              type: 'text' as const,
+              text: { content: args.content }
+            }]
+          }
+        }];
+
+        await notion.blocks.children.append({
+          block_id: args.pageId,
+          children: blocks,
+        });
+
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: "Page updated successfully",
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to update page: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "notion_append_content":
+      try {
+        const blocks = [{
+          object: 'block' as const,
+          type: 'paragraph' as const,
+          paragraph: {
+            rich_text: [{
+              type: 'text' as const,
+              text: { content: args.content }
+            }]
+          }
+        }];
+
+        await notion.blocks.children.append({
+          block_id: args.pageId,
+          children: blocks,
+        });
+
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: "Content appended successfully",
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to append content: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "notion_read_comments":
+      try {
+        const comments = await notion.comments.list({
+          block_id: args.pageId,
+        });
+
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: JSON.stringify(comments, null, 2),
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to read comments: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "notion_add_comment":
+      try {
+        await notion.comments.create({
+          parent: { page_id: args.pageId },
+          rich_text: [{
+            text: { content: args.comment }
+          }],
+        });
+
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: "Comment added successfully",
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to add comment: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "notion_add_to_database":
+      try {
+        // Process tags if provided
+        const properties: any = {
+          // Title is required
+          Name: {
+            title: [
+              {
+                text: {
+                  content: args.title,
+                },
+              },
+            ],
+          },
+        };
+
+        // Add tags if provided
+        if (args.tags && args.tags.length > 0) {
+          properties.Tags = {
+            multi_select: args.tags.map((tag: string) => ({ name: tag }))
+          };
+        }
+
+        // Add any additional properties
+        if (args.properties) {
+          Object.assign(properties, args.properties);
+        }
+
+        const response = await notion.pages.create({
+          parent: {
+            database_id: args.databaseId || NOTION_DATABASE_ID,
+          },
+          properties,
+          // Add content if provided
+          ...(args.content && {
+            children: [
+              {
+                object: 'block',
+                type: 'paragraph',
+                paragraph: {
+                  rich_text: [
+                    {
+                      type: 'text',
+                      text: {
+                        content: args.content,
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        });
+
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Created database entry: https://notion.so/${response.id.replace(/-/g, '')}`,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to create database entry: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
     default:
       return {
         toolResult: {
@@ -269,9 +880,10 @@ async function handleToolCall(name: string, args: any): Promise<{ toolResult: Ca
   }
 }
 
+// 6. Server Setup and Configuration
 const server = new Server(
   {
-    name: "example-servers/puppeteer",
+    name: "example-servers/browserbase",
     version: "0.1.0",
   },
   {
@@ -282,8 +894,7 @@ const server = new Server(
   },
 );
 
-
-// Setup request handlers
+// 7. Request Handlers
 server.setRequestHandler(ListResourcesRequestSchema, async () => ({
   resources: [
     {
@@ -337,6 +948,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) =>
   handleToolCall(request.params.name, request.params.arguments ?? {})
 );
 
+// 8. Server Initialization
 async function runServer() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
